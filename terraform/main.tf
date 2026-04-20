@@ -1,4 +1,11 @@
 terraform {
+  cloud {
+    organization = "avdi"
+    workspaces {
+      name = "lenticel"
+    }
+  }
+
   required_providers {
     vultr = {
       source  = "vultr/vultr"
@@ -80,6 +87,8 @@ resource "vultr_instance" "lenticel" {
     ignore_changes = [
       user_data,   # only runs on first boot; VPS is already provisioned
       ssh_key_ids, # changing this destroys the VPS; manage access via authorized_keys
+      hostname,    # changing this destroys the VPS; existing hostname is "devtunnel"
+      label,       # cosmetic; don't destroy VPS over a label mismatch
     ]
   }
 
