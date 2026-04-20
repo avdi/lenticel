@@ -1,0 +1,16 @@
+# Copy to terraform.tfvars (gitignored) — or export as TF_VAR_* env vars.
+# API keys are best kept as env vars:
+#   export TF_VAR_vultr_api_key=...
+#   export TF_VAR_bunny_api_key=...
+
+domain = "example.com" # Your domain — wildcard *.example.com will be routed to the VPS
+
+vultr_region = "ewr" # New Jersey — change to taste (atl lax ord sea sjc dfw mia)
+
+vultr_plan = "vc2-1c-1gb" # $5/mo — 1 vCPU 1 GB RAM
+
+# List of Vultr SSH key IDs to authorize on the instance.
+# Find IDs in Vultr dashboard → Account → SSH Keys.
+vultr_ssh_key_ids = [
+  "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+]

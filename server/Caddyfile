@@ -1,0 +1,17 @@
+ctl.{$LENTICEL_DOMAIN} {
+    tls {
+        dns bunny {env.BUNNY_API_KEY}
+    }
+
+    reverse_proxy host.docker.internal:9191
+}
+
+*.{$LENTICEL_DOMAIN} {
+    tls {
+        dns bunny {env.BUNNY_API_KEY}
+    }
+
+    reverse_proxy frps:8080 {
+        header_up Host {host}
+    }
+}

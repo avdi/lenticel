@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# Usage: lenticel [<project>] [-- <command>...]
+#        lenticel [<project>] edit
+#        lenticel [<project>] env
+#        lenticel --help
+#
+# <project> is both the subdomain and the config filename:
+#   ~/.config/lenticel/projects/<project>.toml
+# If LENTICEL_NAME is set, <project> can be omitted.
+#
+# With no subcommand: starts the tunnel (frpc in foreground).
+# With -- <cmd>: starts frpc in background, exports env vars, execs <cmd>.
+# edit: opens (or creates) the project config in $EDITOR.
+# env: prints templated env vars for sourcing (eval $(lenticel env)).
+#
+# Config example (~/.config/lenticel/projects/myapp.toml):
+#
+#   subdomain = "myapp"
+#
+#   [[ports]]
+#   port = 3000
+#   label = "rails"
+#
+#   [[ports]]
+#   port = 3036
+#   label = "vite"
+#
+#   [env]
+#   MYAPP_HOSTNAME = "{rails}"
+#   VITE_RUBY_ASSET_HOST = "https://{vite}"
+#
+# First port → <subdomain>.<server-domain>
+# Subsequent ports → <subdomain>-<label>.<server-domain>
+#
+# Without a config file, env vars bootstrap the config:
+#   LENTICEL_NAME   project/subdomain name
+#   LENTICEL_PORTS     "port[:label] ..." (e.g. "3000 3036:vite")
+#   LENTICEL_ENV       semicolon-delimited KEY=VALUE with {label} templates
+set -euo pipefail
+
+LENTICEL_DIR="$HOME/.config/lenticel"
+PROJECTS_DIR="$LENTICEL_DIR/projects"
+BASE_CONFIG="$LENTICEL_DIR/frpc.toml"
+
+# Read serverAddr from base frpc config (memoized in _SERVER_DOMAIN).
+_server_domain() {
+  if [[ -z "${_SERVER_DOMAIN:-}" ]]; then
+    _SERVER_DOMAIN=$(awk -F'"' '/^serverAddr[[:space:]]*=/{print $2; exit}' "$BASE_CONFIG" 2>/dev/null || true)
+  fi
+  echo "${_SERVER_DOMAIN}"
+}
+
+# ---- usage ----
+_usage() {
+  sed -n '2,/^set -/{ /^set -/d; s/^# \{0,1\}//; p }' "$0"
+  exit 0
+}
+
+# ---- minimal TOML parser ----
+# Reads a project TOML and sets: SUBDOMAIN, PORTS[], PORT_LABELS[], ENV_VARS[]
+_parse_project_toml() {
+  local file="$1"
+  SUBDOMAIN=""
+  PORTS=()
+  PORT_LABELS=()
+  ENV_VARS=()  # "KEY=value_template" entries
+
+  local in_ports=false in_env=false current_port="" current_label=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # strip comments and trailing whitespace
+    line="${line%%#*}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+
+    # section headers
+    if [[ "$line" == "[[ports]]" ]]; then
+      # flush previous port
+      if [[ -n "$current_port" ]]; then
+        PORTS+=("$current_port")
+        PORT_LABELS+=("${current_label:-$current_port}")
+      fi
+      current_port=""
+      current_label=""
+      in_ports=true
+      in_env=false
+      continue
+    elif [[ "$line" == "[env]" ]]; then
+      # flush last port
+      if [[ -n "$current_port" ]]; then
+        PORTS+=("$current_port")
+        PORT_LABELS+=("${current_label:-$current_port}")
+      fi
+      current_port=""
+      current_label=""
+      in_ports=false
+      in_env=true
+      continue
+    elif [[ "$line" =~ ^\[.*\] ]]; then
+      # some other section — flush and skip
+      if [[ -n "$current_port" ]]; then
+        PORTS+=("$current_port")
+        PORT_LABELS+=("${current_label:-$current_port}")
+      fi
+      current_port=""
+      current_label=""
+      in_ports=false
+      in_env=false
+      continue
+    fi
+
+    # key = value parsing
+    local key val
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"  # rtrim
+    key="${key#"${key%%[![:space:]]*}"}"  # ltrim
+    val="${val%"${val##*[![:space:]]}"}"  # rtrim
+    val="${val#"${val%%[![:space:]]*}"}"  # ltrim
+    val="${val#\"}"                        # strip quotes
+    val="${val%\"}"
+
+    if $in_ports; then
+      case "$key" in
+        port) current_port="$val" ;;
+        label) current_label="$val" ;;
+      esac
+    elif $in_env; then
+      ENV_VARS+=("${key}=${val}")
+    elif [[ "$key" == "subdomain" ]]; then
+      SUBDOMAIN="$val"
+    fi
+  done < "$file"
+
+  # flush last port
+  if [[ -n "$current_port" ]]; then
+    PORTS+=("$current_port")
+    PORT_LABELS+=("${current_label:-$current_port}")
+  fi
+}
+
+# ---- build config from env vars ----
+_config_from_env() {
+  SUBDOMAIN="${LENTICEL_NAME}"
+  PORTS=()
+  PORT_LABELS=()
+  ENV_VARS=()
+
+  if [[ -n "${LENTICEL_PORTS:-}" ]]; then
+    for spec in $LENTICEL_PORTS; do
+      local port="${spec%%:*}"
+      local label="${spec#*:}"
+      [[ "$label" == "$port" ]] && label="$port"
+      PORTS+=("$port")
+      PORT_LABELS+=("$label")
+    done
+  else
+    # single-port fallback
+    PORTS+=("${LENTICEL_PORT:-3000}")
+    PORT_LABELS+=("${SUBDOMAIN}")
+  fi
+
+  if [[ -n "${LENTICEL_ENV:-}" ]]; then
+    local IFS=';'
+    for entry in $LENTICEL_ENV; do
+      # trim whitespace
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      [[ -n "$entry" ]] && ENV_VARS+=("$entry")
+    done
+  fi
+}
+
+# ---- resolve label → hostname ----
+_label_to_host() {
+  local label="$1" index="$2"
+  local domain
+  domain=$(_server_domain)
+  if [[ "$index" -eq 0 ]]; then
+    echo "${SUBDOMAIN}.${domain}"
+  else
+    echo "${SUBDOMAIN}-${label}.${domain}"
+  fi
+}
+
+# ---- template env vars ----
+# Replaces {label} with the corresponding hostname
+_template_env_vars() {
+  RESOLVED_ENV=()
+  for entry in "${ENV_VARS[@]}"; do
+    local key="${entry%%=*}"
+    local val="${entry#*=}"
+    # replace each {label} placeholder
+    for i in "${!PORT_LABELS[@]}"; do
+      local label="${PORT_LABELS[$i]}"
+      local host
+      host=$(_label_to_host "$label" "$i")
+      val="${val//\{${label}\}/${host}}"
+    done
+    RESOLVED_ENV+=("${key}=${val}")
+  done
+}
+
+# ---- generate frpc.toml ----
+_generate_frpc_config() {
+  local token="$1" outfile="$2"
+  local server_addr
+  server_addr=$(_server_domain)
+  cat > "$outfile" <<EOF
+serverAddr = "${server_addr}"
+serverPort = 7000
+
+auth.method = "token"
+auth.token = "${token}"
+
+loginFailExit = false
+transport.heartbeatInterval = 10
+EOF
+
+  for i in "${!PORTS[@]}"; do
+    local port="${PORTS[$i]}"
+    local label="${PORT_LABELS[$i]}"
+    local sub
+    if [[ "$i" -eq 0 ]]; then
+      sub="$SUBDOMAIN"
+    else
+      sub="${SUBDOMAIN}-${label}"
+    fi
+    cat >> "$outfile" <<EOF
+
+[[proxies]]
+name = "${sub}"
+type = "http"
+localPort = ${port}
+subdomain = "${sub}"
+requestHeaders.set.X-Forwarded-Proto = "https"
+EOF
+  done
+}
+
+# ---- evict ----
+_evict() {
+  local sub="$1" token="$2"
+  local domain
+  domain=$(_server_domain)
+  echo "Evicting ${sub}.${domain}..."
+  local resp
+  resp=$(curl -sf -X POST \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d "{\"subdomain\": \"$sub\"}" \
+    "https://ctl.${domain}/evict" 2>&1) || true
+
+  if echo "$resp" | grep -q '"ok":true'; then
+    local msg
+    msg=$(echo "$resp" | grep -o '"message":"[^"]*"' | head -1 | cut -d'"' -f4)
+    echo "  ✓ ${msg:-evicted}"
+    if echo "$resp" | grep -q 'restarted'; then
+      sleep 2
+    else
+      sleep 0.5
+    fi
+  else
+    echo "  ⚠ eviction failed (continuing anyway)"
+  fi
+}
+
+_evict_all() {
+  local token="$1"
+  for i in "${!PORTS[@]}"; do
+    local label="${PORT_LABELS[$i]}"
+    local sub
+    if [[ "$i" -eq 0 ]]; then
+      sub="$SUBDOMAIN"
+    else
+      sub="${SUBDOMAIN}-${label}"
+    fi
+    _evict "$sub" "$token"
+  done
+}
+
+# ---- read token ----
+_read_token() {
+  local token
+  token=$(awk -F'"' '/^auth\.token[[:space:]]*=/{print $2; exit}' "$BASE_CONFIG" 2>/dev/null || true)
+  if [[ -z "$token" ]]; then
+    echo "Error: could not read auth.token from $BASE_CONFIG" >&2
+    echo "Run: LENTICEL_TOKEN=your_token_here ~/.config/lenticel/install-frpc.sh" >&2
+    exit 1
+  fi
+  echo "$token"
+}
+
+# ========== MAIN ==========
+
+[[ "${1:-}" == "--help" || "${1:-}" == "-h" ]] && _usage
+
+# ---- parse args ----
+# Grammar: lenticel [<project>] [edit|env|--] [<command>...]
+# If $1 is not a known subcommand or "--", it's the project name.
+# LENTICEL_NAME fills in the project when omitted.
+
+PROJECT=""
+COMMAND=""       # "", "edit", or "env"
+WRAP_CMD=()      # command to exec after --, if any
+
+_is_subcommand() { [[ "$1" == "edit" || "$1" == "env" || "$1" == "--" ]]; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --)  shift; WRAP_CMD=("$@"); break ;;
+    edit|env)
+      COMMAND="$1"; shift ;;
+    -*)  echo "Unknown option: $1" >&2; exit 1 ;;
+    *)
+      if [[ -z "$PROJECT" ]]; then
+        # Could be project name, or could be a wrapped command after --
+        PROJECT="$1"; shift
+      else
+        echo "Unexpected argument: $1" >&2; exit 1
+      fi ;;
+  esac
+done
+
+# If PROJECT looks like it should be LENTICEL_NAME-derived
+if [[ -z "$PROJECT" ]]; then
+  PROJECT="${LENTICEL_NAME:-}"
+fi
+if [[ -z "$PROJECT" ]]; then
+  echo "Usage: lenticel [<project>] [edit|env|-- <command>...]" >&2
+  echo "  Or set LENTICEL_NAME." >&2
+  exit 1
+fi
+PROJECT="${PROJECT%.${_SERVER_DOMAIN:-}}"
+
+PROJECT_FILE="$PROJECTS_DIR/${PROJECT}.toml"
+
+# ---- edit ----
+if [[ "$COMMAND" == "edit" ]]; then
+  mkdir -p "$PROJECTS_DIR"
+  if [[ ! -f "$PROJECT_FILE" ]]; then
+    cat > "$PROJECT_FILE" <<EOF
+subdomain = "${PROJECT}"
+
+[[ports]]
+port = 3000
+# label = "rails"
+
+# [[ports]]
+# port = 3036
+# label = "vite"
+
+# [env]
+# MY_HOSTNAME = "{rails}"
+# VITE_ASSET_HOST = "https://{vite}"
+EOF
+    echo "Created $PROJECT_FILE"
+  fi
+  exec "${EDITOR:-vi}" "$PROJECT_FILE"
+fi
+
+# ---- load project config ----
+if [[ -f "$PROJECT_FILE" ]]; then
+  _parse_project_toml "$PROJECT_FILE"
+elif [[ -n "${LENTICEL_PORTS:-}" ]]; then
+  LENTICEL_NAME="$PROJECT"
+  _config_from_env
+else
+  echo "No config found: $PROJECT_FILE" >&2
+  echo "Run: lenticel $PROJECT edit" >&2
+  exit 1
+fi
+
+# ---- env ----
+if [[ "$COMMAND" == "env" ]]; then
+  _template_env_vars
+  for entry in "${RESOLVED_ENV[@]:-}"; do
+    [[ -n "$entry" ]] && echo "export $entry"
+  done
+  exit 0
+fi
+
+# ---- tunnel ----
+TOKEN=$(_read_token)
+
+RUNTIME_CONFIG=$(mktemp "$LENTICEL_DIR/frpc-${PROJECT}-XXXXXX.toml")
+trap 'rm -f "$RUNTIME_CONFIG"' EXIT
+_generate_frpc_config "$TOKEN" "$RUNTIME_CONFIG"
+
+_evict_all "$TOKEN"
+
+# Print tunnel mappings
+echo ""
+for i in "${!PORTS[@]}"; do
+  echo "  localhost:${PORTS[$i]} → https://$(_label_to_host "${PORT_LABELS[$i]}" "$i")"
+done
+echo ""
+
+# Template env vars (used whether wrapping or not)
+_template_env_vars
+for entry in "${RESOLVED_ENV[@]:-}"; do
+  [[ -n "$entry" ]] && export "${entry?}"
+done
+
+if [[ ${#WRAP_CMD[@]} -gt 0 ]]; then
+  # Wrapping a command: frpc in background, exec the command
+  frpc -c "$RUNTIME_CONFIG" &
+  FRPC_PID=$!
+  trap 'kill $FRPC_PID 2>/dev/null; rm -f "$RUNTIME_CONFIG"' EXIT
+  sleep 1
+  exec "${WRAP_CMD[@]}"
+else
+  # No command to wrap: frpc in foreground
+  exec frpc -c "$RUNTIME_CONFIG"
+fi

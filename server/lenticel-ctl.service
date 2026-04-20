@@ -1,0 +1,14 @@
+[Unit]
+Description=lenticel control API
+After=network.target docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=/opt/lenticel/.env
+ExecStart=/usr/bin/ruby /opt/lenticel/ctl.rb
+Restart=always
+RestartSec=3
+WorkingDirectory=/opt/lenticel
+
+[Install]
+WantedBy=multi-user.target

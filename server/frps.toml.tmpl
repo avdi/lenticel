@@ -1,0 +1,20 @@
+bindPort = 7000
+vhostHTTPPort = 8080
+
+subdomainHost = "${LENTICEL_DOMAIN}"
+
+auth.method = "token"
+auth.token = "${FRP_AUTH_TOKEN}"
+
+# Detect dead frpc clients within 30s (default is 90s).
+# Combined with frpc's loginFailExit=false + heartbeatInterval=10,
+# a new instance will claim a subdomain within ~30s of the old one dying.
+transport.heartbeatTimeout = 30
+
+# Admin dashboard — accessible from the VPS host (127.0.0.1:7500) only.
+# Auth reuses FRP_AUTH_TOKEN. Access via: ssh lenticel -L 7500:localhost:7500
+[webServer]
+addr = "0.0.0.0"
+port = 7500
+user = "admin"
+password = "${FRP_AUTH_TOKEN}"

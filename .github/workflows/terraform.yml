@@ -1,0 +1,44 @@
+name: Terraform Plan
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+  schedule:
+    - cron: '0 9 * * 1'  # Weekly drift check — Monday 9am UTC
+  workflow_dispatch:
+
+jobs:
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.VPS_IP }} >> ~/.ssh/known_hosts
+          # Set up 'lenticel' alias so script/tf.sh works unchanged
+          cat >> ~/.ssh/config <<EOF
+          Host lenticel
+            HostName ${{ secrets.VPS_IP }}
+            User root
+            IdentityFile ~/.ssh/id_ed25519
+            StrictHostKeyChecking no
+          EOF
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Plan
+        run: bash script/tf.sh plan -detailed-exitcode
+        env:
+          TF_VAR_vultr_api_key: ${{ secrets.VULTR_API_KEY }}
+          TF_VAR_bunny_api_key: ${{ secrets.BUNNY_API_KEY }}
