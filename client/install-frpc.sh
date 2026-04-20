@@ -28,7 +28,7 @@ fi
 
 LENTICEL_REPO="${LENTICEL_REPO:-avdi/lenticel}"
 LENTICEL_BRANCH="${LENTICEL_BRANCH:-main}"
-_LENTICEL_RAW="https://raw.githubusercontent.com/${LENTICEL_REPO}/${LENTICEL_BRANCH}/purse"
+_LENTICEL_RAW="https://raw.githubusercontent.com/${LENTICEL_REPO}/${LENTICEL_BRANCH}/client"
 
 _local_or_fetch() {
   local filename="$1" dest="$2"
