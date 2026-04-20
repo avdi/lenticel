@@ -1,4 +1,0 @@
-[submodule "purse"]
-	path = purse
-	url = https://github.com/avdi/purse.git
-	branch = main
