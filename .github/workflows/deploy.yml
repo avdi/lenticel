@@ -54,6 +54,16 @@ jobs:
             --exclude='frps.toml' \
             server/ root@${{ secrets.VPS_IP }}:/opt/lenticel/
 
+      - name: Write .env to VPS
+        run: |
+          {
+            echo "BUNNY_API_KEY=${{ secrets.BUNNY_API_KEY }}"
+            echo "FRP_AUTH_TOKEN=${{ secrets.FRP_AUTH_TOKEN }}"
+            echo "LENTICEL_DOMAIN=${{ secrets.LENTICEL_DOMAIN }}"
+            echo "CADDY_IMAGE=ghcr.io/${{ github.repository_owner }}/lenticel-caddy:latest"
+          } | ssh -i ~/.ssh/id_ed25519 root@${{ secrets.VPS_IP }} \
+              "cat > /opt/lenticel/.env && chmod 600 /opt/lenticel/.env"
+
       - name: Render frps.toml and start Docker stack
         uses: appleboy/ssh-action@v1
         with:
