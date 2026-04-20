@@ -2,4 +2,5 @@ FROM caddy:2-builder AS builder
 RUN xcaddy build --with github.com/caddy-dns/bunny
 
 FROM caddy:2-alpine
+LABEL org.opencontainers.image.source=https://github.com/avdi/lenticel
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
